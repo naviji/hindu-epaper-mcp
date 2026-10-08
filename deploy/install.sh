@@ -40,22 +40,38 @@ python3 -m venv .venv
 .venv/bin/pip install -q --upgrade pip
 .venv/bin/pip install -q -e .
 
-say "Installing Chromium and its libraries"
-sudo "$REPO_DIR/.venv/bin/python" -m playwright install-deps chromium >/dev/null
-# The browser is a large download from Playwright's CDN. Allow it time, retry,
-# and prefer IPv4: on some cloud hosts IPv6 is configured but silently hangs.
-for attempt in 1 2 3; do
-  if NODE_OPTIONS=--dns-result-order=ipv4first PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=300000 \
-     .venv/bin/python -m playwright install chromium; then
-    break
+CHROME_PATH=""
+if [ "$(dpkg --print-architecture)" = amd64 ]; then
+  # Google Chrome from Google's own package. Google sign-in trusts real Chrome
+  # more than Playwright's test build, and dl.google.com is reachable from
+  # hosts that can't reach Playwright's CDN.
+  say "Installing Google Chrome"
+  if ! command -v google-chrome-stable >/dev/null; then
+    TMP_DEB="$(mktemp -d)/google-chrome.deb"
+    curl -4 -fL --retry 3 --connect-timeout 20 -o "$TMP_DEB" \
+      https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    sudo apt-get install -y -qq "$TMP_DEB" >/dev/null
+    rm -f "$TMP_DEB"
   fi
-  if [ "$attempt" = 3 ]; then
-    echo "Chromium download failed 3 times. Check that this host can reach cdn.playwright.dev, then re-run." >&2
-    exit 1
-  fi
-  echo "Download failed; retrying (${attempt}/3)..."
-  sleep 5
-done
+  CHROME_PATH="$(command -v google-chrome-stable)"
+  echo "Using $CHROME_PATH ($("$CHROME_PATH" --version))"
+else
+  # Google Chrome has no Linux build for this architecture; use Playwright's.
+  say "Installing Chromium and its libraries"
+  sudo "$REPO_DIR/.venv/bin/python" -m playwright install-deps chromium >/dev/null
+  for attempt in 1 2 3; do
+    if NODE_OPTIONS=--dns-result-order=ipv4first PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=300000 \
+       .venv/bin/python -m playwright install chromium; then
+      break
+    fi
+    if [ "$attempt" = 3 ]; then
+      echo "Chromium download failed 3 times. Check that this host can reach cdn.playwright.dev, then re-run." >&2
+      exit 1
+    fi
+    echo "Download failed; retrying (${attempt}/3)..."
+    sleep 5
+  done
+fi
 
 if [ ! -f "$ENV_FILE" ]; then
   say "Generating your owner password"
@@ -70,6 +86,12 @@ EOF
   NEW_PASSWORD=1
 else
   NEW_PASSWORD=0
+fi
+
+# Point the server at the installed browser (kept in sync on every run).
+sed -i '/^HINDU_EPAPER_CHROMIUM=/d' "$ENV_FILE"
+if [ -n "$CHROME_PATH" ]; then
+  echo "HINDU_EPAPER_CHROMIUM=${CHROME_PATH}" >> "$ENV_FILE"
 fi
 
 say "Installing systemd service"
