@@ -41,6 +41,18 @@ class BrowserSession:
         self._pw: Playwright | None = None
         self._ctx: BrowserContext | None = None
         self._lock = asyncio.Lock()
+        # Launch settings; remote (HTTP) mode switches these via configure().
+        self.headless: bool | None = None
+        self.viewport = {"width": 1280, "height": 1600}
+        self.device_scale_factor = 1
+        # Pages opened for internal checks; kept out of the live login view.
+        self.internal_pages: set = set()
+
+    def configure(self, *, headless: bool, viewport: dict, device_scale_factor: float) -> None:
+        """Set launch options. Must be called before the browser first starts."""
+        self.headless = headless
+        self.viewport = viewport
+        self.device_scale_factor = device_scale_factor
 
     async def _ensure_context(self, headless: bool) -> BrowserContext:
         """Launch (or return the already-running) persistent context."""
@@ -51,26 +63,34 @@ class BrowserSession:
             "user_data_dir": str(config.session_dir()),
             "headless": headless,
             "user_agent": config.USER_AGENT,
-            "viewport": {"width": 1280, "height": 1600},
+            "viewport": self.viewport,
+            "device_scale_factor": self.device_scale_factor,
             "args": ["--disable-blink-features=AutomationControlled"],
         }
         exe = config.chromium_executable()
         if exe:
             launch_kwargs["executable_path"] = exe
+        proxy = os.environ.get("HINDU_EPAPER_BROWSER_PROXY")
+        if proxy:
+            launch_kwargs["proxy"] = {"server": proxy}
         self._ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
         return self._ctx
 
     async def context(self, headless: bool | None = None) -> BrowserContext:
         """Return a running context suitable for authenticated fetches."""
         async with self._lock:
-            return await self._ensure_context(
-                _headless_default() if headless is None else headless
-            )
+            if headless is None:
+                headless = _headless_default() if self.headless is None else self.headless
+            return await self._ensure_context(headless)
 
     async def current_token(self) -> str | None:
         """Return the Piano auth token if a valid session exists, else None."""
+        token = await self.token_from_open_pages()
+        if token:
+            return token
         ctx = await self.context()
         page = await ctx.new_page()
+        self.internal_pages.add(page)
         try:
             await page.goto(config.READER_URL, wait_until="domcontentloaded")
             # tinypass loads asynchronously; poll briefly for the token.
@@ -81,7 +101,23 @@ class BrowserSession:
                 await asyncio.sleep(0.5)
             return None
         finally:
+            self.internal_pages.discard(page)
             await page.close()
+
+    async def token_from_open_pages(self) -> str | None:
+        """Cheaply read the Piano token from pages already open on the ePaper site."""
+        if self._ctx is None:
+            return None
+        for page in list(self._ctx.pages):
+            if page.is_closed() or not page.url.startswith(config.SITE):
+                continue
+            try:
+                token = await page.evaluate(_TOKEN_JS)
+            except Exception:
+                continue
+            if token:
+                return token
+        return None
 
     async def is_logged_in(self) -> bool:
         return bool(await self.current_token())
@@ -102,7 +138,7 @@ class BrowserSession:
         """
         # Login should be visible so the user can complete Google's flow,
         # unless the caller explicitly forces headless.
-        ctx = await self.context(headless=_headless_default())
+        ctx = await self.context()
 
         if await self.is_logged_in():
             return {"status": "already_logged_in"}

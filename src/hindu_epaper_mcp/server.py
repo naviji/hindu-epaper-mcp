@@ -27,7 +27,40 @@ from . import config
 from .auth import get_session
 from . import hindu_client as hc
 
-mcp = MCPServer("hindu-epaper", version="0.1.0")
+# Tools are collected here and registered on a server built by build_server(),
+# so the same set runs over stdio (local) or HTTP with OAuth (remote).
+TOOLS: list = []
+
+# Set in remote mode: the public base URL, and a callback that turns a file in
+# the downloads directory into a signed, time-limited download link.
+REMOTE: dict = {"public_url": None, "file_link": None}
+
+
+def tool(fn):
+    TOOLS.append(fn)
+    return fn
+
+
+def _login_hint() -> str:
+    if REMOTE["public_url"]:
+        return f"Open {REMOTE['public_url']}/login on your phone to sign in to The Hindu."
+    return "Run the `login` tool."
+
+
+def _out_dir(out_dir: str | None) -> Path:
+    # A remote caller must not choose paths on the server.
+    if out_dir and not REMOTE["public_url"]:
+        return Path(out_dir)
+    return config.downloads_dir()
+
+
+def _file_result(result: dict, path: Path) -> str:
+    if REMOTE["file_link"]:
+        result["download_url"] = REMOTE["file_link"](path)
+        result["detail"] = "Open download_url to get the PDF. The link expires in 24 hours."
+    else:
+        result["path"] = str(path)
+    return json.dumps(result, indent=2)
 
 
 def _date(date: str | None) -> str:
@@ -41,7 +74,7 @@ def _safe_name(edition_id: str, date: str, suffix: str) -> str:
 # ---------------------------------------------------------------------------
 # Authentication
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@tool
 async def login(
     email: str | None = None,
     password: str | None = None,
@@ -58,13 +91,15 @@ async def login(
     Set HINDU_EPAPER_HEADLESS=0 (the default for login) so the window is
     visible and you can complete Google's flow.
     """
+    if REMOTE["public_url"]:
+        return json.dumps({"status": "open_link", "detail": _login_hint()}, indent=2)
     result = await get_session().login(
         email=email, password=password, timeout_seconds=timeout_seconds
     )
     return json.dumps(result, indent=2)
 
 
-@mcp.tool()
+@tool
 async def auth_status() -> str:
     """Report whether a valid subscription session currently exists."""
     ok = await get_session().is_logged_in()
@@ -73,7 +108,7 @@ async def auth_status() -> str:
             "logged_in": ok,
             "detail": "Subscription session active."
             if ok
-            else "No session. Run the `login` tool.",
+            else f"No session. {_login_hint()}",
         },
         indent=2,
     )
@@ -82,7 +117,7 @@ async def auth_status() -> str:
 # ---------------------------------------------------------------------------
 # Browsing (public)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@tool
 async def list_editions(date: str | None = None) -> str:
     """List the city editions of The Hindu published on a date (default: today IST)."""
     d = _date(date)
@@ -98,7 +133,7 @@ async def list_editions(date: str | None = None) -> str:
     return json.dumps({"date": d, "editions": summary}, indent=2)
 
 
-@mcp.tool()
+@tool
 async def list_pages(edition: str, date: str | None = None) -> str:
     """List the pages of an edition's issue (page number, name, section)."""
     d = _date(date)
@@ -111,7 +146,7 @@ async def list_pages(edition: str, date: str | None = None) -> str:
     )
 
 
-@mcp.tool()
+@tool
 async def list_articles(edition: str, date: str | None = None, page: str | None = None) -> str:
     """List article headlines in an edition, optionally restricted to one page."""
     d = _date(date)
@@ -124,7 +159,7 @@ async def list_articles(edition: str, date: str | None = None, page: str | None 
     )
 
 
-@mcp.tool()
+@tool
 async def read_article(edition: str, article_id: str, date: str | None = None) -> str:
     """Fetch the plain text of an article by its id (see list_articles)."""
     d = _date(date)
@@ -152,7 +187,7 @@ async def read_article(edition: str, article_id: str, date: str | None = None) -
 # ---------------------------------------------------------------------------
 # Downloads (subscription-gated)
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@tool
 async def download_page(
     edition: str, page: str, date: str | None = None, out_dir: str | None = None
 ) -> str:
@@ -165,18 +200,18 @@ async def download_page(
     if target is None or not target["pdf_reference"]:
         return json.dumps({"error": f"Page {page} not found in {e['edition_id']} {d}."})
 
-    data = await hc.download_page_pdf(e["edition_id"], e["issue_id"], target["pdf_reference"])
-    out = Path(out_dir) if out_dir else config.downloads_dir()
+    try:
+        data = await hc.download_page_pdf(e["edition_id"], e["issue_id"], target["pdf_reference"])
+    except hc.NotAuthenticatedError:
+        return json.dumps({"error": f"Not signed in to The Hindu. {_login_hint()}"})
+    out = _out_dir(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / _safe_name(e["edition_id"], d, f"_p{page}.pdf")
     path.write_bytes(data)
-    return json.dumps(
-        {"edition": e["edition_id"], "date": d, "page": page, "path": str(path), "bytes": len(data)},
-        indent=2,
-    )
+    return _file_result({"edition": e["edition_id"], "date": d, "page": page, "bytes": len(data)}, path)
 
 
-@mcp.tool()
+@tool
 async def download_edition(
     edition: str, date: str | None = None, out_dir: str | None = None
 ) -> str:
@@ -195,26 +230,60 @@ async def download_edition(
     writer = PdfWriter()
     fetched = 0
     for p in pages:
-        data = await hc.download_page_pdf(e["edition_id"], e["issue_id"], p["pdf_reference"])
+        try:
+            data = await hc.download_page_pdf(e["edition_id"], e["issue_id"], p["pdf_reference"])
+        except hc.NotAuthenticatedError:
+            return json.dumps({"error": f"Not signed in to The Hindu. {_login_hint()}"})
         reader = PdfReader(io.BytesIO(data))
         for pg in reader.pages:
             writer.add_page(pg)
         fetched += 1
 
-    out = Path(out_dir) if out_dir else config.downloads_dir()
+    out = _out_dir(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / _safe_name(e["edition_id"], d, ".pdf")
     with open(path, "wb") as fh:
         writer.write(fh)
-    return json.dumps(
-        {"edition": e["edition_id"], "date": d, "pages": fetched, "path": str(path)},
-        indent=2,
+    return _file_result({"edition": e["edition_id"], "date": d, "pages": fetched}, path)
+
+
+def build_server(**kwargs) -> MCPServer:
+    """Create an MCPServer with every tool registered."""
+    server = MCPServer(
+        "hindu-epaper",
+        version="0.2.0",
+        instructions=(
+            "Reads the user's The Hindu ePaper subscription. Dates default to today (IST). "
+            "Use list_editions, then list_articles/read_article for text or download_edition for the PDF."
+        ),
+        **kwargs,
     )
+    for fn in TOOLS:
+        server.tool()(fn)
+    return server
 
 
 def main() -> None:
-    """Entry point: run the server over stdio."""
-    mcp.run()
+    """Entry point. ``--transport stdio`` (default) or ``--transport http``."""
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(prog="hindu-epaper-mcp")
+    parser.add_argument("--transport", choices=["stdio", "http"],
+                        default=os.environ.get("HINDU_EPAPER_TRANSPORT", "stdio"))
+    parser.add_argument("--host", default=os.environ.get("HINDU_EPAPER_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("HINDU_EPAPER_PORT", "8000")))
+    parser.add_argument("--public-url", default=os.environ.get("HINDU_EPAPER_PUBLIC_URL"),
+                        help="Public HTTPS base URL, e.g. https://hermes.tailXXXX.ts.net")
+    args = parser.parse_args()
+
+    if args.transport == "stdio":
+        build_server().run()
+        return
+
+    from .remote import run_http
+
+    run_http(host=args.host, port=args.port, public_url=args.public_url)
 
 
 if __name__ == "__main__":
