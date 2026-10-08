@@ -1,0 +1,191 @@
+"""Browser-backed authentication for The Hindu ePaper.
+
+The ePaper authenticates with Piano ID (tinypass) on top of a Google OAuth
+sign-in. There is no public API token we can mint ourselves, so we drive a
+real browser, let the user's Google/Piano login happen there, and persist the
+resulting session in a Playwright *persistent context* (a user-data
+directory). Every later run reuses that directory, so the login survives
+across restarts and the user is not asked again until it expires.
+
+A best-effort scripted-credentials path is included, but note that Google
+deliberately blocks fully-automated password entry (CAPTCHA / 2FA / "this
+browser may not be secure"), so the dependable mode is: launch the browser
+once, finish the login by hand, and let the session persist.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Playwright,
+    TimeoutError as PWTimeout,
+)
+
+from . import config
+
+# JS that returns the Piano auth token when the user is signed in, else null.
+_TOKEN_JS = "() => (window.tp && window.tp.pianoId && window.tp.pianoId.getToken) ? window.tp.pianoId.getToken() : null"
+
+
+def _headless_default() -> bool:
+    return os.environ.get("HINDU_EPAPER_HEADLESS", "").lower() in ("1", "true", "yes")
+
+
+class BrowserSession:
+    """Owns a single persistent browser context, lazily launched and reused."""
+
+    def __init__(self) -> None:
+        self._pw: Playwright | None = None
+        self._ctx: BrowserContext | None = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_context(self, headless: bool) -> BrowserContext:
+        """Launch (or return the already-running) persistent context."""
+        if self._ctx is not None:
+            return self._ctx
+        self._pw = await async_playwright().start()
+        launch_kwargs: dict = {
+            "user_data_dir": str(config.session_dir()),
+            "headless": headless,
+            "user_agent": config.USER_AGENT,
+            "viewport": {"width": 1280, "height": 1600},
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        exe = config.chromium_executable()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+        self._ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+        return self._ctx
+
+    async def context(self, headless: bool | None = None) -> BrowserContext:
+        """Return a running context suitable for authenticated fetches."""
+        async with self._lock:
+            return await self._ensure_context(
+                _headless_default() if headless is None else headless
+            )
+
+    async def current_token(self) -> str | None:
+        """Return the Piano auth token if a valid session exists, else None."""
+        ctx = await self.context()
+        page = await ctx.new_page()
+        try:
+            await page.goto(config.READER_URL, wait_until="domcontentloaded")
+            # tinypass loads asynchronously; poll briefly for the token.
+            for _ in range(20):
+                token = await page.evaluate(_TOKEN_JS)
+                if token:
+                    return token
+                await asyncio.sleep(0.5)
+            return None
+        finally:
+            await page.close()
+
+    async def is_logged_in(self) -> bool:
+        return bool(await self.current_token())
+
+    async def login(
+        self,
+        email: str | None = None,
+        password: str | None = None,
+        timeout_seconds: int = 240,
+    ) -> dict:
+        """Establish a session.
+
+        If already logged in, returns immediately. Otherwise opens the login
+        page. When email/password are supplied, attempts the Google flow; in
+        all cases it then waits (up to ``timeout_seconds``) for the login to
+        complete — giving the user time to finish it interactively in the
+        launched browser.
+        """
+        # Login should be visible so the user can complete Google's flow,
+        # unless the caller explicitly forces headless.
+        ctx = await self.context(headless=_headless_default())
+
+        if await self.is_logged_in():
+            return {"status": "already_logged_in"}
+
+        page = await ctx.new_page()
+        try:
+            await page.goto(config.LOGIN_URL, wait_until="domcontentloaded")
+
+            if email and password:
+                await self._try_google_credentials(page, email, password)
+
+            # Wait for the session to appear, whether finished by script or by
+            # the user interacting with the visible browser window.
+            deadline = asyncio.get_event_loop().time() + timeout_seconds
+            while asyncio.get_event_loop().time() < deadline:
+                token = await page.evaluate(_TOKEN_JS)
+                if token:
+                    return {
+                        "status": "logged_in",
+                        "detail": "Session saved; it will be reused on future runs.",
+                    }
+                await asyncio.sleep(1.0)
+
+            return {
+                "status": "timeout",
+                "detail": (
+                    "No session detected before timeout. Complete the Google/Piano "
+                    "login in the opened browser window, then call login again. "
+                    "If running headless, set HINDU_EPAPER_HEADLESS=0 so the window "
+                    "is visible."
+                ),
+            }
+        finally:
+            await page.close()
+
+    async def _try_google_credentials(self, page, email: str, password: str) -> None:
+        """Best-effort scripted Google sign-in. Failures are non-fatal.
+
+        Google frequently blocks automated entry; when it does, we simply leave
+        the browser on the login page for the user to finish by hand.
+        """
+        try:
+            # The Piano modal exposes a "Sign in with Google" button; its exact
+            # markup changes, so match loosely and open the Google popup/page.
+            selectors = [
+                "text=Sign in with Google",
+                "text=Continue with Google",
+                "[aria-label*='Google']",
+                "iframe[title*='Sign in with Google']",
+            ]
+            async with page.context.expect_page(timeout=8000) as popup_info:
+                for sel in selectors:
+                    try:
+                        await page.click(sel, timeout=2000)
+                        break
+                    except PWTimeout:
+                        continue
+            google = await popup_info.value
+            await google.fill("input[type=email]", email, timeout=8000)
+            await google.click("#identifierNext, button:has-text('Next')", timeout=5000)
+            await google.fill("input[type=password]", password, timeout=10000)
+            await google.click("#passwordNext, button:has-text('Next')", timeout=5000)
+        except Exception:
+            # Fall through to interactive completion.
+            return
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._ctx is not None:
+                await self._ctx.close()
+                self._ctx = None
+            if self._pw is not None:
+                await self._pw.stop()
+                self._pw = None
+
+
+# Module-level singleton so login and fetch share one user-data directory
+# (a persistent context cannot be opened twice concurrently).
+_session: BrowserSession | None = None
+
+
+def get_session() -> BrowserSession:
+    global _session
+    if _session is None:
+        _session = BrowserSession()
+    return _session
