@@ -15,7 +15,10 @@ once, finish the login by hand, and let the session persist.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
+import time
 
 from playwright.async_api import (
     async_playwright,
@@ -26,8 +29,29 @@ from playwright.async_api import (
 
 from . import config
 
+log = logging.getLogger("hindu_epaper_mcp")
+
 # JS that returns the Piano auth token when the user is signed in, else null.
 _TOKEN_JS = "() => (window.tp && window.tp.pianoId && window.tp.pianoId.getToken) ? window.tp.pianoId.getToken() : null"
+
+
+# Close the browser after this long without use; it relaunches on demand.
+IDLE_SECONDS = int(os.environ.get("HINDU_EPAPER_BROWSER_IDLE", "600"))
+
+# Requests pages never need for signing in: ad/analytics hosts and the newspaper's
+# page images. Google and Piano (the sign-in providers) are deliberately absent.
+# Context routes don't apply to context.request, so PDF downloads are unaffected.
+_BLOCK = re.compile(
+    r"^https?://([^/]*\.)?("
+    r"googletagmanager\.com|google-analytics\.com|doubleclick\.net|googlesyndication\.com"
+    r"|googleadservices\.com|adservice\.google\.com|facebook\.net|facebook\.com"
+    r"|scorecardresearch\.com|taboola\.com|outbrain\.com|chartbeat\.(com|net)"
+    r"|izooto\.com|moengage\.com|clevertap-prod\.com|hotjar\.com|clarity\.ms"
+    r"|mtdg\.thehindu\.com|truste\.com|trustarc\.com"
+    r")/"
+    r"|^https://epaper\.thehindu\.com/ccidist-ws/.*\.(jpe?g|png)(\?|$)",
+    re.I,
+)
 
 
 def _headless_default() -> bool:
@@ -47,6 +71,10 @@ class BrowserSession:
         self.device_scale_factor = 1
         # Pages opened for internal checks; kept out of the live login view.
         self.internal_pages: set = set()
+        # Number of live-view viewers; the browser is never reaped while > 0.
+        self.pinned = 0
+        self._last_used = time.monotonic()
+        self._reaper: asyncio.Task | None = None
 
     def configure(self, *, headless: bool, viewport: dict, device_scale_factor: float) -> None:
         """Set launch options. Must be called before the browser first starts."""
@@ -65,7 +93,23 @@ class BrowserSession:
             "user_agent": config.USER_AGENT,
             "viewport": self.viewport,
             "device_scale_factor": self.device_scale_factor,
-            "args": ["--disable-blink-features=AutomationControlled"],
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                # Keep Chrome lean so it fits on small (≈1 GB) servers.
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-component-update",
+                "--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication",
+                "--renderer-process-limit=1",
+                "--in-process-gpu",
+                "--js-flags=--max-old-space-size=256",
+            ],
+            # Fail with a clear error instead of hanging for Playwright's 3-minute default.
+            "timeout": 90_000,
         }
         exe = config.chromium_executable()
         if exe:
@@ -73,7 +117,17 @@ class BrowserSession:
         proxy = os.environ.get("HINDU_EPAPER_BROWSER_PROXY")
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
-        self._ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+        log.warning("Launching browser (%s)", "headless" if headless else "headful")
+        started = time.monotonic()
+        try:
+            self._ctx = await self._pw.chromium.launch_persistent_context(**launch_kwargs)
+        except Exception:
+            # Don't leak a Playwright driver per failed attempt; the next call retries cleanly.
+            await self._pw.stop()
+            self._pw = None
+            raise
+        log.warning("Browser ready in %.1fs", time.monotonic() - started)
+        await self._ctx.route(_BLOCK, lambda route: route.abort())
         return self._ctx
 
     async def context(self, headless: bool | None = None) -> BrowserContext:
@@ -81,7 +135,23 @@ class BrowserSession:
         async with self._lock:
             if headless is None:
                 headless = _headless_default() if self.headless is None else self.headless
-            return await self._ensure_context(headless)
+            ctx = await self._ensure_context(headless)
+            self._last_used = time.monotonic()
+            if IDLE_SECONDS > 0 and (self._reaper is None or self._reaper.done()):
+                self._reaper = asyncio.create_task(self._reap_when_idle())
+            return ctx
+
+    def touch(self) -> None:
+        self._last_used = time.monotonic()
+
+    async def _reap_when_idle(self) -> None:
+        """Close the browser after IDLE_SECONDS unused, to free memory on small servers."""
+        while self._ctx is not None:
+            await asyncio.sleep(30)
+            if self.pinned == 0 and time.monotonic() - self._last_used > IDLE_SECONDS:
+                log.warning("Closing idle browser")
+                await self.close()
+                return
 
     async def current_token(self) -> str | None:
         """Return the Piano auth token if a valid session exists, else None."""

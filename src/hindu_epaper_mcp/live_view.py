@@ -51,6 +51,8 @@ class LiveView:
             with contextlib.suppress(Exception):
                 await self._current.close(code=4000)
         self._current = ws
+        session = get_session()
+        session.pinned += 1
         await ws.accept()
         await self._send_json(ws, {"t": "status", "m": "Starting the browser on your server…"})
         try:
@@ -61,8 +63,29 @@ class LiveView:
             with contextlib.suppress(Exception):
                 await ws.close(code=1011)
         finally:
+            session.pinned -= 1
+            session.touch()
             if self._current is ws:
                 self._current = None
+            asyncio.ensure_future(self._release_later())
+
+    async def _release_later(self, grace: float = 120) -> None:
+        """Free the sign-in tab's memory once nobody has watched it for a while.
+
+        The grace period lets a dropped connection or a page reload resume
+        mid-sign-in without losing the user's place.
+        """
+        await asyncio.sleep(grace)
+        session = get_session()
+        if self._current is not None or session.pinned or session._ctx is None:
+            return
+        pages = _visible_pages(session._ctx)
+        for page in pages[:-1]:
+            with contextlib.suppress(Exception):
+                await page.close()
+        if pages:
+            with contextlib.suppress(Exception):
+                await pages[-1].goto("about:blank")
 
     async def _stream(self, ws: WebSocket) -> None:
         ctx = await get_session().context()

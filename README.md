@@ -74,6 +74,14 @@ need to reconnect the connector.
 Downloads (`download_page`, `download_edition`) return a **download link**
 that works for 24 hours, so you can open the PDF on your phone.
 
+### Memory
+
+The server runs a real Chrome only when it needs one. While you are on the
+sign-in page it uses about 400 MB; ads, trackers and the newspaper's page
+images are blocked there to keep it small. Two minutes after you leave the
+page the tab is freed, and after 10 minutes without use Chrome shuts down
+completely and relaunches on demand. A 1 GB server works, but give it swap.
+
 ### Security
 
 - The owner password protects the sign-in page, because that page controls a
@@ -169,6 +177,7 @@ download_edition edition=chennai       # save today's Chennai edition as one PDF
 | `HINDU_EPAPER_TRANSPORT` | `stdio` | `http` for the remote connector. |
 | `HINDU_EPAPER_PUBLIC_URL` | unset | Public HTTPS base URL (remote mode). |
 | `HINDU_EPAPER_OWNER_PASSWORD` | unset | Sign-in page password, 12+ characters (remote mode). |
+| `HINDU_EPAPER_BROWSER_IDLE` | `600` | Seconds of inactivity before the browser is shut down to free memory (`0` keeps it running). |
 | `HINDU_EPAPER_HOST` / `HINDU_EPAPER_PORT` | `127.0.0.1` / `8000` (installer: `8787`, or the next free port) | Where the HTTP server listens. |
 
 ## Notes & limitations

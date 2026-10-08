@@ -81,7 +81,7 @@ def run_http(host: str, port: int, public_url: str | None) -> None:
     get_session().configure(
         headless=not headful,
         viewport={"width": 430, "height": 900},
-        device_scale_factor=2,
+        device_scale_factor=1.5,
     )
 
     provider = HinduOAuthProvider(public_url)
