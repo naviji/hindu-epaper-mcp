@@ -12,11 +12,11 @@
 # upgrades the install and keeps your existing password and login session.
 set -euo pipefail
 
-PORT="${HINDU_EPAPER_PORT:-8000}"
 SERVICE=hindu-epaper-mcp
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$HOME/.config/hindu-epaper-mcp.env"
 RUN_USER="$(id -un)"
+DEFAULT_PORT=8787
 
 say() { printf '\n==> %s\n' "$*"; }
 
@@ -81,7 +81,6 @@ if [ ! -f "$ENV_FILE" ]; then
   cat > "$ENV_FILE" <<EOF
 HINDU_EPAPER_OWNER_PASSWORD=${PASSWORD}
 HINDU_EPAPER_PUBLIC_URL=${PUBLIC_URL}
-HINDU_EPAPER_PORT=${PORT}
 EOF
   NEW_PASSWORD=1
 else
@@ -93,6 +92,21 @@ sed -i '/^HINDU_EPAPER_CHROMIUM=/d' "$ENV_FILE"
 if [ -n "$CHROME_PATH" ]; then
   echo "HINDU_EPAPER_CHROMIUM=${CHROME_PATH}" >> "$ENV_FILE"
 fi
+
+say "Choosing a port"
+# Stop our own service first so the port it holds counts as free.
+sudo systemctl stop ${SERVICE} 2>/dev/null || true
+port_busy() { [ -n "$(ss -ltnH "sport = :$1")" ]; }
+PORT="${HINDU_EPAPER_PORT:-$(sed -n 's/^HINDU_EPAPER_PORT=//p' "$ENV_FILE")}"
+PORT="${PORT:-$DEFAULT_PORT}"
+if port_busy "$PORT"; then
+  echo "Port $PORT is used by another program; looking for a free one."
+  PORT=$DEFAULT_PORT
+  while port_busy "$PORT"; do PORT=$((PORT + 1)); done
+fi
+echo "Using port $PORT"
+sed -i '/^HINDU_EPAPER_PORT=/d' "$ENV_FILE"
+echo "HINDU_EPAPER_PORT=${PORT}" >> "$ENV_FILE"
 
 say "Installing systemd service"
 sudo tee /etc/systemd/system/${SERVICE}.service >/dev/null <<EOF
@@ -116,16 +130,24 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ${SERVICE} >/dev/null
 sudo systemctl restart ${SERVICE}
 
+say "Waiting for the server to start"
+UP=0
+for _ in $(seq 1 45); do
+  if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/login" 2>/dev/null; then UP=1; break; fi
+  sleep 1
+done
+if [ "$UP" != 1 ]; then
+  echo "The server did not start. Its recent logs:" >&2
+  sudo journalctl -u ${SERVICE} -n 30 --no-pager >&2
+  exit 1
+fi
+echo "Server is up on 127.0.0.1:${PORT}"
+
 say "Exposing it over HTTPS with Tailscale Funnel"
 if ! sudo tailscale funnel --bg "$PORT"; then
   echo "Funnel could not be enabled. If it printed a link, open it to allow Funnel for this"
   echo "machine in your tailnet settings, then run: sudo tailscale funnel --bg $PORT"
 fi
-
-for _ in $(seq 1 30); do
-  curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/login" && break
-  sleep 1
-done
 
 say "Done"
 echo "Connector URL : ${PUBLIC_URL}/mcp"

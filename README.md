@@ -51,7 +51,7 @@ Owner password: ...
 ```
 
 If Funnel isn't enabled for your tailnet yet, the script prints a link to
-allow it. Open it, then run `sudo tailscale funnel --bg 8000`.
+allow it. Open it, then run `sudo tailscale funnel --bg <port>` with the port the script printed.
 
 > Claude's connectors connect from Anthropic's servers, not from your phone, so
 > the server must be reachable on the public internet. Funnel does that
@@ -169,7 +169,7 @@ download_edition edition=chennai       # save today's Chennai edition as one PDF
 | `HINDU_EPAPER_TRANSPORT` | `stdio` | `http` for the remote connector. |
 | `HINDU_EPAPER_PUBLIC_URL` | unset | Public HTTPS base URL (remote mode). |
 | `HINDU_EPAPER_OWNER_PASSWORD` | unset | Sign-in page password, 12+ characters (remote mode). |
-| `HINDU_EPAPER_HOST` / `HINDU_EPAPER_PORT` | `127.0.0.1` / `8000` | Where the HTTP server listens. |
+| `HINDU_EPAPER_HOST` / `HINDU_EPAPER_PORT` | `127.0.0.1` / `8000` (installer: `8787`, or the next free port) | Where the HTTP server listens. |
 
 ## Notes & limitations
 
