@@ -42,7 +42,20 @@ python3 -m venv .venv
 
 say "Installing Chromium and its libraries"
 sudo "$REPO_DIR/.venv/bin/python" -m playwright install-deps chromium >/dev/null
-.venv/bin/python -m playwright install chromium >/dev/null
+# The browser is a large download from Playwright's CDN. Allow it time, retry,
+# and prefer IPv4: on some cloud hosts IPv6 is configured but silently hangs.
+for attempt in 1 2 3; do
+  if NODE_OPTIONS=--dns-result-order=ipv4first PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT=300000 \
+     .venv/bin/python -m playwright install chromium; then
+    break
+  fi
+  if [ "$attempt" = 3 ]; then
+    echo "Chromium download failed 3 times. Check that this host can reach cdn.playwright.dev, then re-run." >&2
+    exit 1
+  fi
+  echo "Download failed; retrying (${attempt}/3)..."
+  sleep 5
+done
 
 if [ ! -f "$ENV_FILE" ]; then
   say "Generating your owner password"
