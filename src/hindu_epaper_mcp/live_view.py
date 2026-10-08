@@ -11,12 +11,15 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 
 from playwright.async_api import BrowserContext, Page
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import config
 from .auth import get_session
+
+log = logging.getLogger("hindu_epaper_mcp")
 
 _KEYS = {"Enter", "Backspace", "Tab", "Escape", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"}
 
@@ -49,7 +52,19 @@ class LiveView:
                 await self._current.close(code=4000)
         self._current = ws
         await ws.accept()
+        await self._send_json(ws, {"t": "status", "m": "Starting the browser on your server…"})
+        try:
+            await self._stream(ws)
+        except Exception as exc:  # surface failures on the page, not a black box
+            log.exception("Live view failed")
+            await self._send_json(ws, {"t": "error", "m": f"{type(exc).__name__}: {exc}"[:600]})
+            with contextlib.suppress(Exception):
+                await ws.close(code=1011)
+        finally:
+            if self._current is ws:
+                self._current = None
 
+    async def _stream(self, ws: WebSocket) -> None:
         ctx = await get_session().context()
         await login_page()
         switch = asyncio.Event()
@@ -94,8 +109,6 @@ class LiveView:
         finally:
             receiver.cancel()
             ctx.remove_listener("page", on_new_page)
-            if self._current is ws:
-                self._current = None
 
     async def _frame(self, ws: WebSocket, cdp, ev: dict) -> None:
         with contextlib.suppress(Exception):

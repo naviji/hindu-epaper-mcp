@@ -213,7 +213,7 @@ def _app_page(req: str, client: str | None, csrf: str) -> str:
 <input type=hidden name=csrf value="{csrf}"><div class=row><button type=submit>Cancel</button></div></form>"""
     body = f"""<div class=card>{ask}<p id=status class=muted>Checking your The Hindu session…</p>{actions}</div>
 <div class=card id=viewer><p class=muted>This is a real browser on your server. Tap the 👤 icon at the top of the paper to sign in with Google. Tap to click, drag to scroll, and use the box below to type.</p>
-<div id=url></div><canvas id=screen></canvas>
+<div id=url></div><p id=note class=muted>Connecting to the browser…</p><canvas id=screen></canvas>
 <div class=row><input type=text id=typed placeholder="Type here, then tap Send" autocomplete=off autocapitalize=off autocorrect=off spellcheck=false></div>
 <div class=row><button id=send>Send</button><button data-key=Enter>Enter ⏎</button><button data-key=Backspace>⌫</button><button data-key=Tab>Tab</button></div>
 <div class=row><button data-nav=back>Back</button><button data-nav=reload>Reload</button><button data-nav=home>Start over</button></div></div>
@@ -223,7 +223,7 @@ def _app_page(req: str, client: str | None, csrf: str) -> str:
 
 _SCRIPT = r"""
 const canvas=document.getElementById('screen'),ctx=canvas.getContext('2d');
-let dev={w:430,h:900},ws,signedIn=false;
+let dev={w:430,h:900},ws,signedIn=false,failed=false;const note=document.getElementById('note');
 function connect(){
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/login/screen');
   ws.binaryType='blob';
@@ -231,11 +231,17 @@ function connect(){
     if(typeof e.data==='string'){const m=JSON.parse(e.data);
       if(m.t==='meta'&&m.w){dev={w:m.w,h:m.h}}
       if(m.t==='url'){document.getElementById('url').textContent=m.u}
+      if(m.t==='status'){note.className='muted';note.textContent=m.m;note.hidden=false}
+      if(m.t==='error'){failed=true;note.className='err';note.textContent='The browser on your server failed: '+m.m;note.hidden=false}
       return}
+    note.hidden=true;
     const bmp=await createImageBitmap(e.data);
     if(canvas.width!==bmp.width||canvas.height!==bmp.height){canvas.width=bmp.width;canvas.height=bmp.height}
     ctx.drawImage(bmp,0,0)};
-  ws.onclose=e=>{if(e.code!==4000&&!signedIn)setTimeout(connect,1500)};
+  ws.onclose=e=>{if(e.code===4000||signedIn)return;
+    if(e.code===4401){note.className='err';note.textContent='Your session expired. Reload this page.';note.hidden=false;return}
+    if(!failed){note.className='muted';note.textContent='Reconnecting…';note.hidden=false}
+    setTimeout(connect,failed?8000:1500);failed=false};
 }
 function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m))}
 function pos(e){const r=canvas.getBoundingClientRect();return{x:(e.clientX-r.left)/r.width*dev.w,y:(e.clientY-r.top)/r.height*dev.h}}
